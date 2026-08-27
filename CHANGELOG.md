@@ -6,6 +6,9 @@
 - `accounts` config section mapping vault names to 1Password accounts, so a reference resolves against the account that owns its vault. `op-cache run` can now resolve secrets from several accounts in one invocation, which previously failed because a single `--account`/`OP_ACCOUNT` was applied to every reference.
 - `accounts.default` for the account used by vaults with no explicit mapping.
 
+### Fixed
+- `run` no longer raises a biometric prompt per reference on a cold cache. Reads are grouped by account and the first of each group is read on its own, so the rest reuse the session it establishes instead of each asking 1Password to authorize a process of its own.
+
 ## 0.2.0
 
 ### Added

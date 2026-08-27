@@ -24,37 +24,76 @@ pub fn collect_op_refs(env: &[(String, String)]) -> Vec<&str> {
         .collect()
 }
 
-/// Resolves all op:// references concurrently (bounded) through the cache.
+/// Groups references by the account they will be read from, keeping the order
+/// each account was first seen in.
+pub fn group_by_account<'a, F>(
+    refs: &[&'a str],
+    account_of: F,
+) -> Vec<(Option<String>, Vec<&'a str>)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut groups: Vec<(Option<String>, Vec<&'a str>)> = Vec::new();
+
+    for reference in refs {
+        let account = account_of(reference);
+        match groups.iter_mut().find(|(a, _)| *a == account) {
+            Some((_, group)) => group.push(reference),
+            None => groups.push((account, vec![reference])),
+        }
+    }
+
+    groups
+}
+
+/// Resolves all op:// references through the cache.
 /// Returns a map from reference string to resolved value.
 ///
 /// `account` is an explicit override applied to every reference. Left as `None`,
 /// each reference gets the account its vault is configured for, which is what
 /// lets one command mix secrets from several 1Password accounts.
+///
+/// Reads are grouped by account, and the first reference in each group is read
+/// on its own before the rest go out concurrently. Every `op read` is a separate
+/// process asking 1Password to authorize it, and a cold set of parallel reads
+/// therefore raises one biometric prompt each, because none of them can reuse a
+/// session that does not exist yet. Paying one serial read per account buys a
+/// single prompt for the whole command.
 pub async fn resolve_refs(
     client: &Client,
     refs: &[&str],
     account: Option<&str>,
 ) -> Result<HashMap<String, String>> {
-    let results: Vec<_> = stream::iter(refs.iter().copied())
-        .map(|reference| async move {
-            let result = client.read(reference, account).await;
-            (reference, result)
-        })
-        .buffer_unordered(MAX_CONCURRENT_READS)
-        .collect()
-        .await;
-
     let mut resolved = HashMap::new();
     let mut errors = Vec::new();
 
-    for (reference, result) in results {
-        match result {
-            Ok(value) => {
-                resolved.insert(reference.to_string(), value);
-            }
-            Err(e) => {
-                errors.push(format!("{}: {}", reference, e));
-            }
+    let mut record = |reference: &str, result: Result<String, crate::error::Error>| match result {
+        Ok(value) => {
+            resolved.insert(reference.to_string(), value);
+        }
+        Err(e) => {
+            errors.push(format!("{}: {}", reference, e));
+        }
+    };
+
+    for (_, group) in group_by_account(refs, |reference| client.account_for(reference, account)) {
+        let Some((warmup, rest)) = group.split_first() else {
+            continue;
+        };
+
+        record(warmup, client.read(warmup, account).await);
+
+        let results: Vec<_> = stream::iter(rest.iter().copied())
+            .map(|reference| async move {
+                let result = client.read(reference, account).await;
+                (reference, result)
+            })
+            .buffer_unordered(MAX_CONCURRENT_READS)
+            .collect()
+            .await;
+
+        for (reference, result) in results {
+            record(reference, result);
         }
     }
 
@@ -102,6 +141,44 @@ pub fn exec_command(program: &str, args: &[String], env: &[(String, String)]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_by_account_splits_by_account() {
+        let refs = vec!["op://Private/a/f", "op://Backend/b/f", "op://Private/c/f"];
+        let groups = group_by_account(&refs, |r| {
+            if r.starts_with("op://Backend/") {
+                Some("work".to_string())
+            } else {
+                Some("personal".to_string())
+            }
+        });
+
+        assert_eq!(
+            groups,
+            vec![
+                (
+                    Some("personal".to_string()),
+                    vec!["op://Private/a/f", "op://Private/c/f"]
+                ),
+                (Some("work".to_string()), vec!["op://Backend/b/f"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_account_keeps_one_group_when_account_is_uniform() {
+        let refs = vec!["op://Private/a/f", "op://TDS/b/f"];
+        let groups = group_by_account(&refs, |_| None);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1, refs);
+    }
+
+    #[test]
+    fn group_by_account_empty_input() {
+        let refs: Vec<&str> = vec![];
+        assert!(group_by_account(&refs, |_| None).is_empty());
+    }
 
     #[test]
     fn collect_op_refs_finds_op_values() {

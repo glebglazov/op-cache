@@ -30,6 +30,12 @@ impl Client {
         Ok(response)
     }
 
+    /// The account a reference will be read from, for callers that need to
+    /// group references by account before reading them.
+    pub fn account_for(&self, reference: &str, explicit: Option<&str>) -> Option<String> {
+        self.effective_account(reference, explicit)
+    }
+
     /// Resolve the account to read a reference with.
     ///
     /// Most specific wins: an explicit `--account`, then the account configured
