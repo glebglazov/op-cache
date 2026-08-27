@@ -22,6 +22,7 @@ directories = "5"
 libc = "0.2"
 blake3 = "1"
 futures = "0.3"
+aho-corasick = "1"
 
 [profile.release]
 lto = true

@@ -42,7 +42,39 @@ op-cache stop
 
 ### Running Commands with Secrets
 
-`op-cache run` scans your environment for variables with `op://` values, resolves them all concurrently through the cache, then replaces the current process with your command (via `exec`). If any resolution fails, the command is aborted.
+`op-cache run` scans your environment for variables with `op://` values, resolves them all concurrently through the cache, then runs your command with the resolved values in its environment. If any resolution fails, the command is aborted.
+
+Resolved secrets are concealed in the command's output, so a secret that a tool
+prints — or logs, or bakes into an error message — appears as
+`<concealed by op-cache>`:
+
+```bash
+export GITHUB_TOKEN="op://Private/GitHub/token"
+op-cache run -- env | grep GITHUB_TOKEN
+# GITHUB_TOKEN=<concealed by op-cache>
+```
+
+Concealing means op-cache stays alive as the parent of your command instead of
+`exec`ing it, so that it owns the stream the command writes to. When output is
+going to a terminal the command gets a pty of its own, so colour, progress bars
+and prompts keep working; when output is redirected the command gets plain pipes
+and stdout stays separate from stderr. Exit codes are passed through, and a
+command killed by a signal reports `128 + signal` as a shell would.
+
+Values shorter than 8 characters, and values that are all digits, are left alone:
+a secret whose value is a port number would otherwise conceal unrelated output.
+Multi-line secrets are concealed line by line as well as whole.
+
+Use `--no-masking` when a command is meant to print a secret. That restores the
+old behaviour exactly, `exec` included:
+
+```bash
+op-cache run --no-masking -- ./print-my-token
+```
+
+Masking covers what the command writes to op-cache. A command that opens
+`/dev/tty` itself, or a secret written to a file, is not covered — this stops
+secrets leaking into logs and screenshots, it is not a containment boundary.
 
 ```bash
 # Run a command with secrets in env vars

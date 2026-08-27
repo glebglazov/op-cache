@@ -42,6 +42,11 @@ pub enum Command {
         #[arg(long)]
         account: Option<String>,
 
+        /// Print the command's output as-is instead of concealing resolved
+        /// secrets in it. Needed when a command is meant to print one.
+        #[arg(long)]
+        no_masking: bool,
+
         /// Command and arguments to execute
         #[arg(required = true, num_args = 1..)]
         command: Vec<String>,

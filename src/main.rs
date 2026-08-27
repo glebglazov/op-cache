@@ -3,9 +3,13 @@ mod client;
 mod config;
 mod daemon;
 mod error;
+mod mask;
 mod protocol;
 mod run;
 mod spawn;
+mod supervise;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -20,7 +24,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Read { reference, account } => cmd_read(config, &reference, account.as_deref()),
-        Command::Run { account, command } => cmd_run(config, command, account.as_deref()),
+        Command::Run {
+            account,
+            no_masking,
+            command,
+        } => cmd_run(config, command, account.as_deref(), !no_masking),
         Command::Status => cmd_status(&config),
         Command::Stats => cmd_stats(config),
         Command::Clear => cmd_clear(config),
@@ -43,7 +51,12 @@ fn cmd_read(config: Config, reference: &str, account: Option<&str>) -> Result<()
     })
 }
 
-fn cmd_run(config: Config, command: Vec<String>, account: Option<&str>) -> Result<()> {
+fn cmd_run(
+    config: Config,
+    command: Vec<String>,
+    account: Option<&str>,
+    masking: bool,
+) -> Result<()> {
     let mut env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
@@ -64,7 +77,20 @@ fn cmd_run(config: Config, command: Vec<String>, account: Option<&str>) -> Resul
     })?;
 
     env = run::build_env(&env, &resolved);
-    run::exec_command(&command[0], &command[1..], &env)
+
+    if !masking {
+        return run::exec_command(&command[0], &command[1..], &env);
+    }
+
+    let patterns = mask::patterns(resolved.values().map(String::as_str));
+    if patterns.is_empty() {
+        // Nothing here is worth concealing, so keep the cheaper process model.
+        return run::exec_command(&command[0], &command[1..], &env);
+    }
+
+    let masker = Arc::new(mask::Masker::new(&patterns)?);
+    let code = supervise::run(&command[0], &command[1..], &env, masker)?;
+    std::process::exit(code)
 }
 
 fn cmd_status(config: &Config) -> Result<()> {

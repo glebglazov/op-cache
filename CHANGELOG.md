@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `run` conceals resolved secrets in the command's output, replacing each with `<concealed by op-cache>`. This costs the `exec`: op-cache now supervises the command so it owns the stream being written to, giving it a pty when output is a terminal and pipes when it is not, and passing the command's exit code — or `128 + signal` — back to the shell. `--no-masking` restores the previous `exec` behaviour for commands that are meant to print a secret.
 - `accounts` config section mapping vault names to 1Password accounts, so a reference resolves against the account that owns its vault. `op-cache run` can now resolve secrets from several accounts in one invocation, which previously failed because a single `--account`/`OP_ACCOUNT` was applied to every reference.
 - `accounts.default` for the account used by vaults with no explicit mapping.
 
