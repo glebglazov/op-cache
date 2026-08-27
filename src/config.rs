@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +19,46 @@ pub struct Config {
 
     #[serde(default = "default_op_timeout_seconds")]
     pub op_timeout_seconds: u64,
+
+    #[serde(default)]
+    pub accounts: Accounts,
+}
+
+/// Which 1Password account a secret reference belongs to.
+///
+/// A vault lives in exactly one account, so the mapping is a property of the
+/// machine rather than of each `op://` reference. That keeps references in the
+/// standard form `op` itself accepts, so the same string still works with
+/// `op read` and `op run`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Accounts {
+    /// Account used for any vault without an explicit mapping.
+    #[serde(default)]
+    pub default: Option<String>,
+
+    /// Vault name to account, e.g. `Backend: tripledotstudios.1password.eu`.
+    #[serde(default)]
+    pub vaults: HashMap<String, String>,
+}
+
+/// The vault segment of `op://<vault>/<item>/<field>`.
+pub fn vault_of(reference: &str) -> Option<&str> {
+    let rest = reference.strip_prefix("op://")?;
+    let vault = rest.split('/').next()?;
+    if vault.is_empty() {
+        None
+    } else {
+        Some(vault)
+    }
+}
+
+impl Accounts {
+    /// The account configured for a reference's vault, if any.
+    pub fn for_reference(&self, reference: &str) -> Option<&str> {
+        vault_of(reference)
+            .and_then(|vault| self.vaults.get(vault))
+            .map(String::as_str)
+    }
 }
 
 fn default_socket_path() -> PathBuf {
@@ -48,6 +89,7 @@ impl Default for Config {
             max_entries: default_max_entries(),
             op_path: default_op_path(),
             op_timeout_seconds: default_op_timeout_seconds(),
+            accounts: Accounts::default(),
         }
     }
 }

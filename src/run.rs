@@ -26,6 +26,10 @@ pub fn collect_op_refs(env: &[(String, String)]) -> Vec<&str> {
 
 /// Resolves all op:// references concurrently (bounded) through the cache.
 /// Returns a map from reference string to resolved value.
+///
+/// `account` is an explicit override applied to every reference. Left as `None`,
+/// each reference gets the account its vault is configured for, which is what
+/// lets one command mix secrets from several 1Password accounts.
 pub async fn resolve_refs(
     client: &Client,
     refs: &[&str],

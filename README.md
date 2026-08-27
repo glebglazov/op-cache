@@ -115,6 +115,39 @@ op_timeout_seconds: 30  # Timeout for op commands
 
 All settings are optional - sensible defaults are used.
 
+### Multiple Accounts
+
+If you are signed in to more than one 1Password account, `op read` cannot resolve
+a reference without being told which account owns it. Map each vault to its
+account once, and every reference to that vault resolves correctly:
+
+```yaml
+accounts:
+  default: my.1password.com          # used for unmapped vaults
+  vaults:
+    Backend: work.1password.eu
+    Shared: work.1password.eu
+```
+
+This matters most for `op-cache run`, which resolves every `op://` variable in
+one pass. With a vault map, a single command can mix secrets from several
+accounts:
+
+```bash
+export CONFLUENCE_TOKEN="op://Backend/Confluence/password"   # work account
+export AWS_ACCESS_KEY_ID="op://Private/AWS/access_key_id"    # personal account
+op-cache run -- terraform apply
+```
+
+The account for a reference is chosen most-specific-first: an explicit
+`--account` flag, then the vault mapping, then `OP_ACCOUNT`, then
+`accounts.default`. The vault mapping outranks `OP_ACCOUNT` because a vault lives
+in exactly one account, so an ambient override that disagrees with it can only
+fail.
+
+Because the account is part of the cache key, mapping a vault to a different
+account does not return stale secrets from the old one.
+
 ## Performance
 
 | Operation | Latency |

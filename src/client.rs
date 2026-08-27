@@ -30,12 +30,24 @@ impl Client {
         Ok(response)
     }
 
-    /// Resolve the effective account: explicit flag wins, then OP_ACCOUNT env var.
-    fn effective_account(explicit: Option<&str>) -> Option<String> {
+    /// Resolve the account to read a reference with.
+    ///
+    /// Most specific wins: an explicit `--account`, then the account configured
+    /// for the reference's vault, then `OP_ACCOUNT`, then the configured
+    /// default. The vault mapping outranks `OP_ACCOUNT` because a vault lives in
+    /// exactly one account, so a per-invocation override that contradicts it can
+    /// only ever fail.
+    fn effective_account(&self, reference: &str, explicit: Option<&str>) -> Option<String> {
         if let Some(acct) = explicit {
             return Some(acct.to_string());
         }
-        std::env::var("OP_ACCOUNT").ok().filter(|v| !v.is_empty())
+        if let Some(acct) = self.config.accounts.for_reference(reference) {
+            return Some(acct.to_string());
+        }
+        std::env::var("OP_ACCOUNT")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| self.config.accounts.default.clone())
     }
 
     /// Hash the reference (and optional account) for use as cache key
@@ -61,7 +73,7 @@ impl Client {
         // Ensure daemon is running
         ensure_daemon_running(&self.config)?;
 
-        let effective = Self::effective_account(account);
+        let effective = self.effective_account(reference, account);
         let key = Self::cache_key(reference, effective.as_deref());
 
         // Check cache first
@@ -71,7 +83,9 @@ impl Client {
             Response::Hit { value } => Ok(value),
             Response::Miss => {
                 // Cache miss - execute op read ourselves
-                let value = self.execute_op_read(reference, effective.as_deref()).await?;
+                let value = self
+                    .execute_op_read(reference, effective.as_deref())
+                    .await?;
 
                 // Store in cache
                 let _ = self
@@ -155,6 +169,9 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{vault_of, Accounts};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     #[test]
     fn cache_key_without_account() {
@@ -186,33 +203,118 @@ mod tests {
         assert_ne!(with, without);
     }
 
+    /// `effective_account` reads the process-wide OP_ACCOUNT, so these cases
+    /// cannot run concurrently without clobbering each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn client_with(accounts: Accounts) -> Client {
+        Client::new(Config {
+            accounts,
+            ..Config::default()
+        })
+    }
+
+    fn mapping(vault: &str, account: &str) -> Accounts {
+        Accounts {
+            default: None,
+            vaults: HashMap::from([(vault.to_string(), account.to_string())]),
+        }
+    }
+
+    #[test]
+    fn vault_of_extracts_vault() {
+        assert_eq!(vault_of("op://Backend/item/field"), Some("Backend"));
+        assert_eq!(vault_of("op://Private/item/field"), Some("Private"));
+    }
+
+    #[test]
+    fn vault_of_handles_vaults_with_spaces() {
+        assert_eq!(vault_of("op://My Vault/item/field"), Some("My Vault"));
+    }
+
+    #[test]
+    fn vault_of_rejects_non_references() {
+        assert_eq!(vault_of("not-a-reference"), None);
+        assert_eq!(vault_of("op://"), None);
+        assert_eq!(vault_of("op:///item/field"), None);
+    }
+
     #[test]
     fn effective_account_explicit_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("OP_ACCOUNT", "env.1password.com");
-        let result = Client::effective_account(Some("explicit.1password.com"));
+        let client = client_with(mapping("Backend", "mapped.1password.com"));
+        let result =
+            client.effective_account("op://Backend/item/field", Some("explicit.1password.com"));
         std::env::remove_var("OP_ACCOUNT");
         assert_eq!(result.as_deref(), Some("explicit.1password.com"));
     }
 
     #[test]
-    fn effective_account_falls_back_to_env() {
+    fn effective_account_uses_vault_mapping() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OP_ACCOUNT");
+        let client = client_with(mapping("Backend", "work.1password.eu"));
+        let result = client.effective_account("op://Backend/item/field", None);
+        assert_eq!(result.as_deref(), Some("work.1password.eu"));
+    }
+
+    #[test]
+    fn effective_account_vault_mapping_outranks_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("OP_ACCOUNT", "env.1password.com");
-        let result = Client::effective_account(None);
+        let client = client_with(mapping("Backend", "work.1password.eu"));
+        let result = client.effective_account("op://Backend/item/field", None);
+        std::env::remove_var("OP_ACCOUNT");
+        assert_eq!(result.as_deref(), Some("work.1password.eu"));
+    }
+
+    #[test]
+    fn effective_account_ignores_mapping_for_other_vaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OP_ACCOUNT");
+        let client = client_with(mapping("Backend", "work.1password.eu"));
+        let result = client.effective_account("op://Private/item/field", None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn effective_account_falls_back_to_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OP_ACCOUNT", "env.1password.com");
+        let client = client_with(Accounts::default());
+        let result = client.effective_account("op://Private/item/field", None);
         std::env::remove_var("OP_ACCOUNT");
         assert_eq!(result.as_deref(), Some("env.1password.com"));
     }
 
     #[test]
-    fn effective_account_none_when_unset() {
+    fn effective_account_falls_back_to_configured_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("OP_ACCOUNT");
-        let result = Client::effective_account(None);
+        let client = client_with(Accounts {
+            default: Some("my.1password.com".to_string()),
+            vaults: HashMap::new(),
+        });
+        let result = client.effective_account("op://Private/item/field", None);
+        assert_eq!(result.as_deref(), Some("my.1password.com"));
+    }
+
+    #[test]
+    fn effective_account_none_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OP_ACCOUNT");
+        let client = client_with(Accounts::default());
+        let result = client.effective_account("op://Private/item/field", None);
         assert_eq!(result, None);
     }
 
     #[test]
     fn effective_account_ignores_empty_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("OP_ACCOUNT", "");
-        let result = Client::effective_account(None);
+        let client = client_with(Accounts::default());
+        let result = client.effective_account("op://Private/item/field", None);
         std::env::remove_var("OP_ACCOUNT");
         assert_eq!(result, None);
     }

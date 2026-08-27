@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `accounts` config section mapping vault names to 1Password accounts, so a reference resolves against the account that owns its vault. `op-cache run` can now resolve secrets from several accounts in one invocation, which previously failed because a single `--account`/`OP_ACCOUNT` was applied to every reference.
+- `accounts.default` for the account used by vaults with no explicit mapping.
+
 ## 0.2.0
 
 ### Added

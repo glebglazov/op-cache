@@ -16,7 +16,8 @@ pub enum Command {
         /// Secret reference (e.g., op://vault/item/field)
         reference: String,
 
-        /// 1Password account to use (e.g., my.1password.com)
+        /// 1Password account to use (e.g., my.1password.com).
+        /// Defaults to the account configured for the reference's vault.
         #[arg(long)]
         account: Option<String>,
     },
@@ -36,7 +37,8 @@ pub enum Command {
     /// Run a command with op:// env vars resolved through the cache
     #[command(trailing_var_arg = true)]
     Run {
-        /// 1Password account to use (e.g., my.1password.com)
+        /// 1Password account to use for every reference (e.g., my.1password.com).
+        /// Defaults to the account configured for each reference's vault.
         #[arg(long)]
         account: Option<String>,
 
