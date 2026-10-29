@@ -7,6 +7,10 @@
 - `accounts` config section mapping vault names to 1Password accounts, so a reference resolves against the account that owns its vault. `op-cache run` can now resolve secrets from several accounts in one invocation, which previously failed because a single `--account`/`OP_ACCOUNT` was applied to every reference.
 - `accounts.default` for the account used by vaults with no explicit mapping.
 - `failure_ttl_seconds` (default 60): a failed read is answered from memory for this long instead of running `op` again, so shells started while 1Password is locked fail at once rather than each waiting out a timeout. `op-cache clear` forgets failures too.
+- `op-cache config` prints the config file's path and the settings in effect, and warns when the running daemon started before the file last changed.
+
+### Documentation
+- The README named `~/.config/op-cache/config.yaml` as the config file everywhere; on macOS it is `~/Library/Application Support/op-cache/config.yaml`.
 
 ### Changed
 - `op_timeout_seconds` defaults to 5 instead of 30. A read blocks the shell that started it, and 5 seconds is enough to answer a biometric prompt.

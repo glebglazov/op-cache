@@ -38,6 +38,9 @@ op-cache clear
 
 # Stop the daemon
 op-cache stop
+
+# Show the config file's path and the settings in effect
+op-cache config
 ```
 
 ### Running Commands with Secrets
@@ -146,7 +149,13 @@ each waiting out another timeout. `op-cache clear` forgets it.
 
 ## Configuration
 
-Config file: `~/.config/op-cache/config.yaml`
+Config file:
+
+- macOS: `~/Library/Application Support/op-cache/config.yaml`
+- Linux: `~/.config/op-cache/config.yaml` (or `$XDG_CONFIG_HOME/op-cache/config.yaml`)
+
+`op-cache config` prints the path and the settings in effect, as YAML you can
+paste into the file.
 
 ```yaml
 socket_path: /tmp/op-cache.sock
@@ -158,6 +167,11 @@ failure_ttl_seconds: 60 # How long a failed read is not retried (0: always retry
 ```
 
 All settings are optional - sensible defaults are used.
+
+The daemon reads `ttl_seconds`, `failure_ttl_seconds` and `max_entries` once,
+when it starts. After changing them, run `op-cache stop`; the next read starts
+a daemon with the new values (and an empty cache). `op-cache config` warns when
+the running daemon predates the file.
 
 ### Multiple Accounts
 
