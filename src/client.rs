@@ -223,8 +223,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// A client whose `op` is the given shell script.
-    fn client_with_op(test: &str, script: &str) -> (Client, std::path::PathBuf) {
+    /// A client whose `op` is the given shell script. A script can take over a
+    /// second to start on a busy machine, so `timeout` leaves room for that.
+    fn client_with_op(test: &str, script: &str, timeout: u64) -> (Client, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("op-cache-{}-{}", test, std::process::id()));
@@ -235,7 +236,7 @@ mod tests {
 
         let client = Client::new(Config {
             op_path: op.to_string_lossy().into_owned(),
-            op_timeout_seconds: 1,
+            op_timeout_seconds: timeout,
             ..Config::default()
         });
         (client, dir)
@@ -253,8 +254,11 @@ mod tests {
 
     #[tokio::test]
     async fn op_read_returns_the_secret() {
-        let (client, dir) =
-            client_with_op("ok", r#"[ "$1 $2" = "read op://v/i/f" ] && echo s3cret"#);
+        let (client, dir) = client_with_op(
+            "ok",
+            r#"[ "$1 $2" = "read op://v/i/f" ] && echo s3cret"#,
+            10,
+        );
         let value = client.execute_op_read("op://v/i/f", None).await;
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(value.unwrap(), "s3cret");
@@ -262,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn op_read_failure_carries_stderr() {
-        let (client, dir) = client_with_op("err", "echo 'account is locked' >&2; exit 1");
+        let (client, dir) = client_with_op("err", "echo 'account is locked' >&2; exit 1", 10);
         let result = client.execute_op_read("op://v/i/f", None).await;
         std::fs::remove_dir_all(&dir).ok();
         assert!(matches!(result, Err(Error::OpFailed(e)) if e == "account is locked"));
@@ -274,13 +278,15 @@ mod tests {
         let (client, dir) = client_with_op(
             "hang",
             r#"sleep 600 & echo $$ $! > "$(dirname "$0")/pids"; exec sleep 600"#,
+            3,
         );
 
         let result = client.execute_op_read("op://v/i/f", None).await;
-        assert!(matches!(result, Err(Error::OpFailed(e)) if e.contains("timed out")));
-
-        let pids = std::fs::read_to_string(dir.join("pids")).unwrap();
+        let pids = std::fs::read_to_string(dir.join("pids"));
         std::fs::remove_dir_all(&dir).ok();
+
+        assert!(matches!(result, Err(Error::OpFailed(e)) if e.contains("timed out")));
+        let pids = pids.expect("the fake op did not start before the timeout");
         for pid in pids.split_whitespace() {
             for _ in 0..40 {
                 if gone(pid) {
