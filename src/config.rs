@@ -20,6 +20,11 @@ pub struct Config {
     #[serde(default = "default_op_timeout_seconds")]
     pub op_timeout_seconds: u64,
 
+    /// How long a failed read is answered from memory instead of running `op`
+    /// again. 0 retries every time.
+    #[serde(default = "default_failure_ttl_seconds")]
+    pub failure_ttl_seconds: u64,
+
     #[serde(default)]
     pub accounts: Accounts,
 }
@@ -77,8 +82,14 @@ fn default_op_path() -> String {
     "op".to_string()
 }
 
+/// Long enough to answer a biometric prompt. A read blocks the shell that
+/// started it, and `op` waiting on a locked 1Password never gives up by itself.
 fn default_op_timeout_seconds() -> u64 {
-    30
+    5
+}
+
+fn default_failure_ttl_seconds() -> u64 {
+    60
 }
 
 impl Default for Config {
@@ -89,6 +100,7 @@ impl Default for Config {
             max_entries: default_max_entries(),
             op_path: default_op_path(),
             op_timeout_seconds: default_op_timeout_seconds(),
+            failure_ttl_seconds: default_failure_ttl_seconds(),
             accounts: Accounts::default(),
         }
     }

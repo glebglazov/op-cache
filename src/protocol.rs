@@ -9,6 +9,11 @@ pub enum Request {
     ClearCache,
     GetStats,
     Shutdown,
+    /// Like `Get`, but a cold key comes back `Claimed` to one client at a time
+    /// and a recent failure comes back `Failed`. The claimant reports with `Set`
+    /// or `Fail` on the same connection; closing it gives the claim up.
+    Lookup { key: String },
+    Fail { key: String, error: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +25,8 @@ pub enum Response {
     CacheCleared,
     Stats(CacheStats),
     ShuttingDown,
+    Failed { error: String },
+    Claimed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

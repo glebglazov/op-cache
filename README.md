@@ -133,6 +133,17 @@ Cache Statistics:
 
 The client (not the daemon) executes `op read`. This ensures proper access to your desktop session and 1Password app integration.
 
+A cold secret is read once however many clients ask for it at the same time:
+the daemon lets the first client read it and holds the others until the result
+is in. That matters when a secret is exported from a shell profile and several
+shells start at once.
+
+`op read` waiting on a locked 1Password never gives up on its own, so a read
+that takes longer than `op_timeout_seconds` is killed, together with the
+`op daemon` it started. The failure is then remembered for
+`failure_ttl_seconds`: shells starting in the meantime fail at once instead of
+each waiting out another timeout. `op-cache clear` forgets it.
+
 ## Configuration
 
 Config file: `~/.config/op-cache/config.yaml`
@@ -142,7 +153,8 @@ socket_path: /tmp/op-cache.sock
 ttl_seconds: 86400      # Cache TTL (default: 24 hours)
 max_entries: 1000       # Max cached secrets
 op_path: op             # Path to op CLI
-op_timeout_seconds: 30  # Timeout for op commands
+op_timeout_seconds: 5   # Timeout for op commands
+failure_ttl_seconds: 60 # How long a failed read is not retried (0: always retry)
 ```
 
 All settings are optional - sensible defaults are used.

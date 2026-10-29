@@ -1,3 +1,4 @@
+use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::net::UnixStream;
@@ -82,26 +83,39 @@ impl Client {
         let effective = self.effective_account(reference, account);
         let key = Self::cache_key(reference, effective.as_deref());
 
-        // Check cache first
-        let response = self.send_request(Request::Get { key: key.clone() }).await?;
+        // One connection for the whole read: the daemon lets one client at a
+        // time read a cold key, and takes the read back if this connection drops.
+        let mut stream = self.connect().await?;
+        write_message(&mut stream, &Request::Lookup { key: key.clone() }).await?;
 
-        match response {
+        match read_message(&mut stream).await? {
             Response::Hit { value } => Ok(value),
-            Response::Miss => {
-                // Cache miss - execute op read ourselves
-                let value = self
-                    .execute_op_read(reference, effective.as_deref())
-                    .await?;
+            Response::Failed { error } => Err(Error::OpFailed(format!(
+                "{} (failed within the last {}s; `op-cache clear` retries now)",
+                error, self.config.failure_ttl_seconds
+            ))),
+            Response::Claimed => {
+                let result = self.execute_op_read(reference, effective.as_deref()).await;
 
-                // Store in cache
-                let _ = self
-                    .send_request(Request::Set {
+                let report = match &result {
+                    Ok(value) => Request::Set {
                         key,
                         value: value.clone(),
-                    })
-                    .await;
+                    },
+                    Err(Error::OpFailed(error)) => Request::Fail {
+                        key,
+                        error: error.clone(),
+                    },
+                    Err(e) => Request::Fail {
+                        key,
+                        error: e.to_string(),
+                    },
+                };
+                if write_message(&mut stream, &report).await.is_ok() {
+                    let _ = read_message::<_, Response>(&mut stream).await;
+                }
 
-                Ok(value)
+                result
             }
             _ => Err(Error::Protocol("unexpected response".to_string())),
         }
@@ -119,15 +133,36 @@ impl Client {
         if let Some(acct) = account {
             cmd.arg("--account").arg(acct);
         }
-        let output = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| {
-            Error::OpFailed(format!(
-                "op read timed out after {}s for {}",
-                self.config.op_timeout_seconds, reference
-            ))
-        })?
-        .map_err(|e| Error::OpFailed(format!("failed to execute op: {}", e)))?;
+        // `op` waiting on a locked 1Password or an unanswered permission prompt
+        // never gives up, so a read that times out is killed, not left behind.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| Error::OpFailed(format!("failed to execute op: {}", e)))?;
+        let pid = child.id();
+
+        let output = child.wait_with_output();
+        tokio::pin!(output);
+        let output = match tokio::time::timeout(timeout, &mut output).await {
+            Ok(result) => {
+                result.map_err(|e| Error::OpFailed(format!("failed to execute op: {}", e)))?
+            }
+            Err(_) => {
+                // `op read` starts an `op daemon` of its own, which hangs with
+                // it. Kill it while `op read` still owns it, then return, which
+                // drops `output` and kills `op read`.
+                if let Some(pid) = pid {
+                    kill_children(pid).await;
+                }
+                return Err(Error::OpFailed(format!(
+                    "op read timed out after {}s for {}",
+                    self.config.op_timeout_seconds, reference
+                )));
+            }
+        };
 
         if output.status.success() {
             let value = String::from_utf8_lossy(&output.stdout)
@@ -172,12 +207,90 @@ impl Client {
     }
 }
 
+async fn kill_children(pid: u32) {
+    let _ = Command::new("pkill")
+        .arg("-KILL")
+        .arg("-P")
+        .arg(pid.to_string())
+        .status()
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{vault_of, Accounts};
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// A client whose `op` is the given shell script.
+    fn client_with_op(test: &str, script: &str) -> (Client, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("op-cache-{}-{}", test, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("op");
+        std::fs::write(&op, format!("#!/bin/sh\n{}\n", script)).unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let client = Client::new(Config {
+            op_path: op.to_string_lossy().into_owned(),
+            op_timeout_seconds: 1,
+            ..Config::default()
+        });
+        (client, dir)
+    }
+
+    /// Gone, or killed and only waiting to be reaped.
+    fn gone(pid: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        stat.trim().is_empty() || stat.trim().starts_with('Z')
+    }
+
+    #[tokio::test]
+    async fn op_read_returns_the_secret() {
+        let (client, dir) =
+            client_with_op("ok", r#"[ "$1 $2" = "read op://v/i/f" ] && echo s3cret"#);
+        let value = client.execute_op_read("op://v/i/f", None).await;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(value.unwrap(), "s3cret");
+    }
+
+    #[tokio::test]
+    async fn op_read_failure_carries_stderr() {
+        let (client, dir) = client_with_op("err", "echo 'account is locked' >&2; exit 1");
+        let result = client.execute_op_read("op://v/i/f", None).await;
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(result, Err(Error::OpFailed(e)) if e == "account is locked"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_op_read_is_killed_with_its_daemon() {
+        // `op read` hanging on a locked 1Password, next to the `op daemon` it started.
+        let (client, dir) = client_with_op(
+            "hang",
+            r#"sleep 600 & echo $$ $! > "$(dirname "$0")/pids"; exec sleep 600"#,
+        );
+
+        let result = client.execute_op_read("op://v/i/f", None).await;
+        assert!(matches!(result, Err(Error::OpFailed(e)) if e.contains("timed out")));
+
+        let pids = std::fs::read_to_string(dir.join("pids")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        for pid in pids.split_whitespace() {
+            for _ in 0..40 {
+                if gone(pid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(gone(pid), "process {} outlived the timeout", pid);
+        }
+    }
 
     #[test]
     fn cache_key_without_account() {
