@@ -1,11 +1,13 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 use anyhow::{bail, Result};
 use futures::stream::{self, StreamExt};
+use tokio::sync::watch;
 
-use crate::client::Client;
+use crate::client::{Client, Lookup};
 
 const MAX_CONCURRENT_READS: usize = 8;
 
@@ -53,12 +55,17 @@ where
 /// each reference gets the account its vault is configured for, which is what
 /// lets one command mix secrets from several 1Password accounts.
 ///
-/// Reads are grouped by account, and the first reference in each group is read
-/// on its own before the rest go out concurrently. Every `op read` is a separate
-/// process asking 1Password to authorize it, and a cold set of parallel reads
-/// therefore raises one biometric prompt each, because none of them can reuse a
-/// session that does not exist yet. Paying one serial read per account buys a
-/// single prompt for the whole command.
+/// Every `op read` is a separate process asking 1Password to authorize it, and
+/// parallel reads with no session yet raise one biometric prompt each. So in
+/// each account, the first reference that misses the cache is read on its own,
+/// and the other misses wait for it and then reuse the session it established:
+/// one prompt per account. A cached reference never counts as that first read,
+/// because it starts no `op` process and so establishes no session.
+///
+/// Each miss is read as soon as the daemon claims it for us, and the only wait
+/// before that is for the account's first read. A claim makes other clients
+/// wait for this one, so collecting every claim before reading any could
+/// deadlock two commands that each hold a secret the other is waiting for.
 pub async fn resolve_refs(
     client: &Client,
     refs: &[&str],
@@ -67,33 +74,42 @@ pub async fn resolve_refs(
     let mut resolved = HashMap::new();
     let mut errors = Vec::new();
 
-    let mut record = |reference: &str, result: Result<String, crate::error::Error>| match result {
-        Ok(value) => {
-            resolved.insert(reference.to_string(), value);
-        }
-        Err(e) => {
-            errors.push(format!("{}: {}", reference, e));
-        }
-    };
-
     for (_, group) in group_by_account(refs, |reference| client.account_for(reference, account)) {
-        let Some((warmup, rest)) = group.split_first() else {
-            continue;
-        };
+        let first_read_taken = Cell::new(false);
+        let (first_read_done, first_read_done_rx) = watch::channel(false);
+        let (first_read_taken, first_read_done) = (&first_read_taken, &first_read_done);
 
-        record(warmup, client.read(warmup, account).await);
-
-        let results: Vec<_> = stream::iter(rest.iter().copied())
-            .map(|reference| async move {
-                let result = client.read(reference, account).await;
-                (reference, result)
+        let results: Vec<_> = stream::iter(group)
+            .map(|reference| {
+                let mut first_read_done_rx = first_read_done_rx.clone();
+                async move {
+                    let result = match client.lookup(reference, account).await {
+                        Err(e) => Err(e),
+                        Ok(Lookup::Hit(value)) => Ok(value),
+                        Ok(Lookup::Claimed(claim)) if !first_read_taken.replace(true) => {
+                            let result = claim.read().await;
+                            first_read_done.send_replace(true);
+                            result
+                        }
+                        Ok(Lookup::Claimed(claim)) => {
+                            let _ = first_read_done_rx.wait_for(|done| *done).await;
+                            claim.read().await
+                        }
+                    };
+                    (reference, result)
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_READS)
             .collect()
             .await;
 
         for (reference, result) in results {
-            record(reference, result);
+            match result {
+                Ok(value) => {
+                    resolved.insert(reference.to_string(), value);
+                }
+                Err(e) => errors.push(format!("{}: {}", reference, e)),
+            }
         }
     }
 
@@ -141,6 +157,82 @@ pub fn exec_command(program: &str, args: &[String], env: &[(String, String)]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::daemon::server::Server;
+
+    /// A client of a real daemon, run in this process on a private socket,
+    /// whose `op` logs when each read starts and ends.
+    async fn client_with_daemon(test: &str) -> (Client, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("op-cache-run-{}-{}", test, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let op = dir.join("op");
+        std::fs::write(
+            &op,
+            "#!/bin/sh\n\
+             log=\"$(dirname \"$0\")/log\"\n\
+             echo \"start $2\" >> \"$log\"\n\
+             sleep 0.3\n\
+             echo \"end $2\" >> \"$log\"\n\
+             echo \"value of $2\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = Config {
+            socket_path: dir.join("sock"),
+            op_path: op.to_string_lossy().into_owned(),
+            op_timeout_seconds: 10,
+            ..Config::default()
+        };
+        // `ensure_daemon_running` trusts a pid file naming a live process.
+        std::fs::write(config.pid_path(), std::process::id().to_string()).unwrap();
+
+        let server = Server::new(config.clone());
+        tokio::spawn(async move { server.run().await });
+        while std::os::unix::net::UnixStream::connect(&config.socket_path).is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        (Client::new(config), dir)
+    }
+
+    #[tokio::test]
+    async fn resolve_refs_reads_the_first_miss_alone_when_the_first_reference_is_cached() {
+        let (client, dir) = client_with_daemon("first-miss").await;
+        let account = Some("work");
+        client.read("op://v/cached/f", account).await.unwrap();
+        std::fs::remove_file(dir.join("log")).unwrap();
+
+        let refs = ["op://v/cached/f", "op://v/a/f", "op://v/b/f", "op://v/c/f"];
+        let resolved = resolve_refs(&client, &refs, account).await;
+        let log = std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let resolved = resolved.unwrap();
+        for reference in refs {
+            assert_eq!(resolved[reference], format!("value of {}", reference));
+        }
+
+        let log: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            log.len(),
+            6,
+            "one read per miss, none for the cached one: {:?}",
+            log
+        );
+        let first = log[0]
+            .strip_prefix("start ")
+            .expect("log opens with a read");
+        assert_eq!(
+            log[1],
+            format!("end {}", first),
+            "the first miss finishes before another read starts: {:?}",
+            log
+        );
+    }
 
     #[test]
     fn group_by_account_splits_by_account() {
