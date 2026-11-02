@@ -69,7 +69,20 @@ impl Client {
 
     /// Read a secret, using cache if available
     pub async fn read(&self, reference: &str, account: Option<&str>) -> Result<String, Error> {
-        // Validate reference format
+        match self.lookup(reference, account).await? {
+            Lookup::Hit(value) => Ok(value),
+            Lookup::Claimed(claim) => claim.read().await,
+        }
+    }
+
+    /// Ask the daemon for a secret without running `op`. A cold secret comes
+    /// back as a claim to read it, which lets a caller see which of its secrets
+    /// will need `op` before it starts any of them.
+    pub async fn lookup(
+        &self,
+        reference: &str,
+        account: Option<&str>,
+    ) -> Result<Lookup<'_>, Error> {
         if !reference.starts_with("op://") {
             return Err(Error::InvalidReference(format!(
                 "reference must start with 'op://': {}",
@@ -77,7 +90,6 @@ impl Client {
             )));
         }
 
-        // Ensure daemon is running
         ensure_daemon_running(&self.config)?;
 
         let effective = self.effective_account(reference, account);
@@ -89,34 +101,18 @@ impl Client {
         write_message(&mut stream, &Request::Lookup { key: key.clone() }).await?;
 
         match read_message(&mut stream).await? {
-            Response::Hit { value } => Ok(value),
+            Response::Hit { value } => Ok(Lookup::Hit(value)),
             Response::Failed { error } => Err(Error::OpFailed(format!(
                 "{} (failed within the last {}s; `op-cache clear` retries now)",
                 error, self.config.failure_ttl_seconds
             ))),
-            Response::Claimed => {
-                let result = self.execute_op_read(reference, effective.as_deref()).await;
-
-                let report = match &result {
-                    Ok(value) => Request::Set {
-                        key,
-                        value: value.clone(),
-                    },
-                    Err(Error::OpFailed(error)) => Request::Fail {
-                        key,
-                        error: error.clone(),
-                    },
-                    Err(e) => Request::Fail {
-                        key,
-                        error: e.to_string(),
-                    },
-                };
-                if write_message(&mut stream, &report).await.is_ok() {
-                    let _ = read_message::<_, Response>(&mut stream).await;
-                }
-
-                result
-            }
+            Response::Claimed => Ok(Lookup::Claimed(Claim {
+                client: self,
+                stream,
+                key,
+                reference: reference.to_string(),
+                account: effective,
+            })),
             _ => Err(Error::Protocol("unexpected response".to_string())),
         }
     }
@@ -204,6 +200,56 @@ impl Client {
             Response::ShuttingDown => Ok(()),
             _ => Err(Error::Protocol("unexpected response".to_string())),
         }
+    }
+}
+
+/// What the daemon holds for a secret.
+pub enum Lookup<'a> {
+    Hit(String),
+    Claimed(Claim<'a>),
+}
+
+/// The daemon's go-ahead for this client to read a cold secret with `op`.
+/// Other clients that want the secret wait until `read` reports the result, or
+/// until the claim is dropped, which closes the connection and hands the read
+/// to the next of them. Hold a claim only while its read is under way or about
+/// to be: whoever waits for it waits for that.
+pub struct Claim<'a> {
+    client: &'a Client,
+    stream: UnixStream,
+    key: String,
+    reference: String,
+    account: Option<String>,
+}
+
+impl Claim<'_> {
+    /// Run `op read` and give the result to the daemon, so the waiting clients
+    /// get it too.
+    pub async fn read(mut self) -> Result<String, Error> {
+        let result = self
+            .client
+            .execute_op_read(&self.reference, self.account.as_deref())
+            .await;
+
+        let report = match &result {
+            Ok(value) => Request::Set {
+                key: self.key,
+                value: value.clone(),
+            },
+            Err(Error::OpFailed(error)) => Request::Fail {
+                key: self.key,
+                error: error.clone(),
+            },
+            Err(e) => Request::Fail {
+                key: self.key,
+                error: e.to_string(),
+            },
+        };
+        if write_message(&mut self.stream, &report).await.is_ok() {
+            let _ = read_message::<_, Response>(&mut self.stream).await;
+        }
+
+        result
     }
 }
 
