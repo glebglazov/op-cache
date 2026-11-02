@@ -9,6 +9,7 @@ mod run;
 mod spawn;
 mod supervise;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -33,6 +34,7 @@ fn main() -> Result<()> {
         Command::Stats => cmd_stats(config),
         Command::Clear => cmd_clear(config),
         Command::Stop => cmd_stop(config),
+        Command::Config => cmd_config(&config),
         Command::Daemon => cmd_daemon(config),
         Command::DaemonForeground => cmd_daemon_foreground(config),
     }
@@ -162,6 +164,32 @@ fn cmd_stop(config: Config) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Prints the settings as YAML that can go straight into the config file.
+fn cmd_config(config: &Config) -> Result<()> {
+    let path = Config::config_path()?;
+    if path.exists() {
+        println!("# {}", path.display());
+    } else {
+        println!("# {} (not found, defaults in use)", path.display());
+    }
+    print!("{}", serde_yaml::to_string(config)?);
+
+    // The daemon reads the file once, before it writes its pid file.
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if daemon::is_running(config) {
+        if let (Some(changed), Some(started)) = (modified(&path), modified(&config.pid_path())) {
+            if changed > started {
+                println!(
+                    "# The running daemon started before this file changed and still uses\n\
+                     # the previous ttl_seconds, failure_ttl_seconds and max_entries.\n\
+                     # `op-cache stop` applies them (and empties the cache)."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_daemon(config: Config) -> Result<()> {

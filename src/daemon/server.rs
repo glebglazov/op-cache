@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::protocol::{read_message, write_message, Request, Response};
 
-use super::cache::Cache;
+use super::cache::{Cache, Claim, Lookup};
 
 pub struct Server {
     config: Config,
@@ -17,7 +17,11 @@ pub struct Server {
 
 impl Server {
     pub fn new(config: Config) -> Self {
-        let cache = Arc::new(Cache::new(config.max_entries, config.ttl_seconds));
+        let cache = Arc::new(Cache::new(
+            config.max_entries,
+            config.ttl_seconds,
+            config.failure_ttl_seconds,
+        ));
 
         Self { config, cache }
     }
@@ -102,6 +106,9 @@ async fn handle_connection(
     shutdown_rx: &mut watch::Receiver<bool>,
     shutdown_tx: Arc<watch::Sender<bool>>,
 ) -> Result<(), Error> {
+    // Held while this client reads a key; dropped with the connection.
+    let mut claim: Option<Claim> = None;
+
     loop {
         tokio::select! {
             result = read_message::<_, Request>(&mut stream) => {
@@ -117,7 +124,7 @@ async fn handle_connection(
 
                 debug!("received request: {:?}", request);
 
-                let response = handle_request(&request, &cache).await;
+                let response = handle_request(&request, &cache, &mut claim).await;
                 let is_shutdown = matches!(request, Request::Shutdown);
 
                 write_message(&mut stream, &response).await?;
@@ -137,7 +144,7 @@ async fn handle_connection(
     }
 }
 
-async fn handle_request(request: &Request, cache: &Cache) -> Response {
+async fn handle_request(request: &Request, cache: &Cache, claim: &mut Option<Claim>) -> Response {
     match request {
         Request::Get { key } => {
             if let Some(value) = cache.get(key).await {
@@ -146,8 +153,22 @@ async fn handle_request(request: &Request, cache: &Cache) -> Response {
                 Response::Miss
             }
         }
+        Request::Lookup { key } => match cache.lookup(key).await {
+            Lookup::Hit(value) => Response::Hit { value },
+            Lookup::Failed(error) => Response::Failed { error },
+            Lookup::Claimed(claimed) => {
+                *claim = Some(claimed);
+                Response::Claimed
+            }
+        },
         Request::Set { key, value } => {
             cache.insert(key, value.clone()).await;
+            release(claim, key);
+            Response::Stored
+        }
+        Request::Fail { key, error } => {
+            cache.insert_failure(key, error.clone()).await;
+            release(claim, key);
             Response::Stored
         }
         Request::Ping => Response::Pong,
@@ -157,5 +178,13 @@ async fn handle_request(request: &Request, cache: &Cache) -> Response {
         }
         Request::GetStats => Response::Stats(cache.stats()),
         Request::Shutdown => Response::ShuttingDown,
+    }
+}
+
+/// Gives up the claim on `key` once its result is stored, which wakes the
+/// clients waiting for it.
+fn release(claim: &mut Option<Claim>, key: &str) {
+    if claim.as_ref().is_some_and(|c| c.key() == key) {
+        *claim = None;
     }
 }

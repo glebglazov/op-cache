@@ -34,6 +34,9 @@ pub enum Command {
     /// Stop the daemon
     Stop,
 
+    /// Show where the config file is and the settings in effect
+    Config,
+
     /// Run a command with op:// env vars resolved through the cache
     #[command(trailing_var_arg = true)]
     Run {
