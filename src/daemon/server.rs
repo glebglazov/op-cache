@@ -27,16 +27,25 @@ impl Server {
     }
 
     pub async fn run(&self) -> Result<(), Error> {
-        // Remove existing socket if present
-        let _ = std::fs::remove_file(&self.config.socket_path);
-
-        // Set restrictive umask before binding to avoid permission race window
-        let old_umask = unsafe { libc::umask(0o177) };
-        let bind_result = UnixListener::bind(&self.config.socket_path);
-        unsafe { libc::umask(old_umask) }; // Restore umask
-
-        let listener = bind_result
-            .map_err(|e| Error::Internal(format!("failed to bind socket: {}", e)))?;
+        let path = &self.config.socket_path;
+        let listener = match bind(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Replacing the socket of a daemon still serving it would leave
+                // that daemon running, unreachable, for good.
+                if UnixStream::connect(path).await.is_ok() {
+                    return Err(Error::Internal(format!(
+                        "another daemon is already listening on {:?}",
+                        path
+                    )));
+                }
+                // ponytail: two daemons replacing the same stale socket at once
+                // can still orphan one; a stale socket is only left by a crash.
+                let _ = std::fs::remove_file(path);
+                bind(path)
+            }
+            result => result,
+        }
+        .map_err(|e| Error::Internal(format!("failed to bind socket: {}", e)))?;
 
         // Verify permissions (belt and suspenders)
         if let Err(e) = std::fs::set_permissions(
@@ -46,6 +55,11 @@ impl Server {
             let _ = std::fs::remove_file(&self.config.socket_path);
             return Err(Error::Internal(format!("failed to set socket permissions: {}", e)));
         }
+
+        // Written only once the socket is ours, so a daemon that finds another
+        // one running leaves that one's pid file alone.
+        std::fs::write(self.config.pid_path(), format!("{}\n", std::process::id()))
+            .map_err(|e| Error::Internal(format!("failed to write pid file: {}", e)))?;
 
         info!("daemon listening on {:?}", self.config.socket_path);
 
@@ -98,6 +112,17 @@ impl Server {
 
         Ok(())
     }
+}
+
+/// Binds with a restrictive umask, so the socket is never reachable by others.
+fn bind(path: &std::path::Path) -> std::io::Result<UnixListener> {
+    // The umask is the process's: two binds overlapping would leave it at 0o177.
+    static UMASK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = UMASK.lock().unwrap_or_else(|e| e.into_inner());
+    let old_umask = unsafe { libc::umask(0o177) };
+    let result = UnixListener::bind(path);
+    unsafe { libc::umask(old_umask) };
+    result
 }
 
 async fn handle_connection(
@@ -186,5 +211,64 @@ async fn handle_request(request: &Request, cache: &Cache, claim: &mut Option<Cla
 fn release(claim: &mut Option<Claim>, key: &str) {
     if claim.as_ref().is_some_and(|c| c.key() == key) {
         *claim = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn config(test: &str) -> Config {
+        let dir =
+            std::env::temp_dir().join(format!("op-cache-server-{}-{}", test, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Not left to the umask: a daemon binding in another test sets it to 0o177.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_file(dir.join("sock"));
+        let _ = std::fs::remove_file(dir.join("sock.pid"));
+        Config {
+            socket_path: dir.join("sock"),
+            ..Config::default()
+        }
+    }
+
+    async fn start(config: &Config) {
+        let server = Server::new(config.clone());
+        tokio::spawn(async move { server.run().await });
+        while std::os::unix::net::UnixStream::connect(&config.socket_path).is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn second_daemon_leaves_the_running_one_alone() {
+        let config = config("second");
+        start(&config).await;
+        let socket = std::fs::metadata(&config.socket_path).unwrap().ino();
+
+        let second = tokio::time::timeout(Duration::from_secs(2), Server::new(config.clone()).run())
+            .await
+            .expect("the second daemon took over the socket and kept running");
+
+        assert!(second.is_err());
+        assert_eq!(std::fs::metadata(&config.socket_path).unwrap().ino(), socket);
+        let mut stream = UnixStream::connect(&config.socket_path).await.unwrap();
+        write_message(&mut stream, &Request::Ping).await.unwrap();
+        let response: Response = read_message(&mut stream).await.unwrap();
+        assert!(matches!(response, Response::Pong));
+    }
+
+    /// macOS deletes files in /tmp left unchanged for 3 days, and reading one
+    /// does not count as a change.
+    #[tokio::test]
+    async fn daemon_is_running_without_its_pid_file() {
+        let config = config("nopid");
+        start(&config).await;
+        let _ = std::fs::remove_file(config.pid_path());
+
+        assert!(crate::daemon::is_running(&config));
     }
 }

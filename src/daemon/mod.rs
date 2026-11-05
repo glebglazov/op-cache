@@ -2,7 +2,6 @@ pub mod cache;
 pub mod server;
 
 use std::fs::File;
-use std::io::Write;
 
 use fork::{daemon, Fork};
 use tracing::info;
@@ -59,13 +58,6 @@ fn run_daemon(config: Config) -> Result<(), Error> {
 }
 
 fn run_daemon_inner(config: Config) -> Result<(), Error> {
-    // Write PID file
-    let pid_path = config.pid_path();
-    let mut pid_file = File::create(&pid_path)
-        .map_err(|e| Error::Internal(format!("failed to create pid file: {}", e)))?;
-    writeln!(pid_file, "{}", std::process::id())
-        .map_err(|e| Error::Internal(format!("failed to write pid: {}", e)))?;
-
     info!("daemon starting with pid {}", std::process::id());
 
     // Create tokio runtime
@@ -81,23 +73,12 @@ fn run_daemon_inner(config: Config) -> Result<(), Error> {
     })
 }
 
-/// Check if daemon is running by checking PID file and process
+/// The daemon is running when its socket takes a connection. The pid file does
+/// not tell: macOS deletes files in /tmp left unchanged for 3 days, and a client
+/// trusting it then started a second daemon, which took over the socket and
+/// left the first one running, unreachable.
 pub fn is_running(config: &Config) -> bool {
-    let pid_path = config.pid_path();
-
-    if !pid_path.exists() {
-        return false;
-    }
-
-    if let Ok(contents) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = contents.trim().parse::<i32>() {
-            unsafe {
-                return libc::kill(pid, 0) == 0;
-            }
-        }
-    }
-
-    false
+    std::os::unix::net::UnixStream::connect(&config.socket_path).is_ok()
 }
 
 /// Get the PID of the running daemon

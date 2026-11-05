@@ -276,6 +276,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("op-cache-{}-{}", test, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Not left to the umask: a daemon binding in another test sets it to 0o177.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let op = dir.join("op");
         std::fs::write(&op, format!("#!/bin/sh\n{}\n", script)).unwrap();
         std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();

@@ -18,6 +18,7 @@
 ### Fixed
 - `op read` processes no longer pile up while 1Password is locked or a macOS permission prompt is unanswered. A timed-out read used to be abandoned, not killed, and stayed behind with the `op daemon` it had started: two processes per secret for every shell started meanwhile, until the user's process limit was reached. Timed-out reads are now killed with their `op daemon`.
 - Concurrent reads of the same cold secret run `op read` once. The daemon lets the first client read it and holds the rest until the result is in; if that client goes away without reporting, the next one reads instead.
+- A daemon no longer gets orphaned every few days. macOS deletes files in `/tmp` left unchanged for 3 days, the pid file among them, and a client then took the daemon for gone and started another, which replaced its socket and left it running, unreachable. A daemon is now running when its socket takes a connection, and a new one leaves a socket that is still served alone.
 - `run` no longer raises a biometric prompt per reference that misses the cache. In each account, the first reference that misses is read on its own, so the other misses reuse the session it establishes instead of each asking 1Password to authorize a process of its own. A reference already in the cache does not count as that first read: it starts no `op` process, so it establishes no session.
 
 ## 0.2.0
