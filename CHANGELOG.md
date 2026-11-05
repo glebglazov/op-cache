@@ -13,7 +13,6 @@
 - The README named `~/.config/op-cache/config.yaml` as the config file everywhere; on macOS it is `~/Library/Application Support/op-cache/config.yaml`.
 
 ### Changed
-- `op_timeout_seconds` defaults to 5 instead of 30. A read blocks the shell that started it, and 5 seconds is enough to answer a biometric prompt.
 - The daemon protocol gains `Lookup` and `Fail`. Stop a daemon left running by an earlier version (`op-cache stop`); it does not understand them.
 
 ### Fixed

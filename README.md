@@ -162,7 +162,7 @@ socket_path: /tmp/op-cache.sock
 ttl_seconds: 86400      # Cache TTL (default: 24 hours)
 max_entries: 1000       # Max cached secrets
 op_path: op             # Path to op CLI
-op_timeout_seconds: 5   # Timeout for op commands
+op_timeout_seconds: 30  # Timeout for op commands
 failure_ttl_seconds: 60 # How long a failed read is not retried (0: always retry)
 ```
 
