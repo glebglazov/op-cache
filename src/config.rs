@@ -82,10 +82,11 @@ fn default_op_path() -> String {
     "op".to_string()
 }
 
-/// Long enough to answer a biometric prompt. A read blocks the shell that
-/// started it, and `op` waiting on a locked 1Password never gives up by itself.
+/// Long enough to notice 1Password's prompt and answer it, and in a terminal
+/// macOS first asks about, that prompt as well. A read killed before then never
+/// gets the authorization, so the next one prompts again.
 fn default_op_timeout_seconds() -> u64 {
-    5
+    30
 }
 
 fn default_failure_ttl_seconds() -> u64 {
